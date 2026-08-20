@@ -11,6 +11,7 @@ Layout (little-endian, 40-byte header + payloads):
   bytes 28:31 pcm_s16le_len u32 (byte length of PCM int16 mono)
   bytes 32:35 text_utf8_len u32
   bytes 36:39 chunks_done u32 (avatar chunk index, same as JSON chunks_done)
+  bytes 40:43 flags u32 (bit 0: is_mouth_moving, bit 1: is_meaningful_speech)
   (44-byte header total)
 Then: jpeg_bytes | pcm_s16le_bytes | text_utf8_bytes
 
@@ -34,6 +35,7 @@ def pack_av_frame(
     pcm_s16le: bytes,
     text: str,
     chunks_done: int,
+    flags: int = 0,
 ) -> bytes:
     tb = text.encode("utf-8", errors="replace")[:16000]
     if len(jpeg) > 12_000_000:
@@ -49,6 +51,34 @@ def pack_av_frame(
         len(pcm_s16le) & 0xFFFFFFFF,
         len(tb) & 0xFFFFFFFF,
         int(chunks_done) & 0xFFFFFFFF,
-        0,
+        int(flags) & 0xFFFFFFFF,
     )
     return hdr + jpeg + pcm_s16le + tb
+
+
+def unpack_av_frame(blob: bytes) -> dict:
+    if len(blob) < 44:
+        raise ValueError("blob too small for header")
+    fields = _HEADER.unpack(blob[:44])
+    magic, version, frame_number, chunk_id_ui, gen_ms, sample_rate, jpeg_len, pcm_len, text_len, chunks_done, flags = fields
+    if magic != MAGIC or version != 1:
+        raise ValueError("Invalid magic or version")
+    offset = 44
+    jpeg = blob[offset:offset + jpeg_len]
+    offset += jpeg_len
+    pcm = blob[offset:offset + pcm_len]
+    offset += pcm_len
+    text = blob[offset:offset + text_len].decode("utf-8", errors="replace")
+    return {
+        "frame_number": frame_number,
+        "chunk_id_ui": chunk_id_ui,
+        "gen_ms": gen_ms,
+        "sample_rate": sample_rate,
+        "jpeg": jpeg,
+        "pcm": pcm,
+        "text": text,
+        "chunks_done": chunks_done,
+        "flags": flags,
+        "is_mouth_moving": bool(flags & 1),
+        "is_meaningful_speech": bool(flags & 2),
+    }

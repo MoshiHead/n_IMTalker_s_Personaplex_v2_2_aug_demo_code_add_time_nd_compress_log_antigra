@@ -259,6 +259,21 @@
     let moshiTranscript = "";
     let targetFps = 25;
 
+    // Client-side latency measurement state
+    let clientActiveTurnId = null;
+    let clientTurnServerSendTime = 0;
+    let clientAudioReceiveTime = 0;
+    let clientAudioReceiveWall = 0;
+    let clientAudioBufferStartTime = 0;
+    let clientTurnLatencyReported = false;
+    let clientAvatarFirstFrameRecvTime = 0;
+    let clientAvatarFirstFrameRenderTime = 0;
+    let clientAvatarFirstMouthMovementTime = 0;
+    let clientAvatarFirstMeaningfulSpeechTime = 0;
+    let clientAvatarLatencyReported = false;
+    let clientClockOffset = 0;
+    let networkRttMs = 0;
+
     const $ = id => document.getElementById(id);
     const startBtn = $("startBtn"), stopBtn = $("stopBtn"), reconnectBtn = $("reconnectBtn");
     const statusPill = $("statusPill"), videoCanvas = $("videoCanvas");
@@ -440,8 +455,47 @@
     }
 
     // Audio playback
+    function reportScheduleLatency(now) {
+      if (!clientTurnLatencyReported && clientActiveTurnId !== null) {
+        clientTurnLatencyReported = true;
+        const nowMs = performance.now();
+        const recv_t = clientAudioReceiveTime || nowMs;
+        const buf_t = clientAudioBufferStartTime || recv_t;
+        const play_delay_s = Math.max(0, playbackCursor - now);
+        const play_t = nowMs + play_delay_s * 1000;
+
+        let server_to_client_s = 0.001;
+        if (clientTurnServerSendTime > 0) {
+          server_to_client_s = Math.max(0.0005, (Date.now() - (clientTurnServerSendTime * 1000 + clientClockOffset)) / 1000);
+        } else if (networkRttMs > 0) {
+          server_to_client_s = Math.max(0.0005, (networkRttMs / 2) / 1000);
+        }
+
+        const client_recv_to_buffer_s = Math.max(0.0, (buf_t - recv_t) / 1000);
+        const buffer_to_playback_s = Math.max(0.0, (play_t - buf_t) / 1000);
+        const client_total_s = Math.max(0.0, (play_t - recv_t) / 1000);
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "client_audio_latency",
+            turn_id: clientActiveTurnId,
+            server_to_client_s: Number(server_to_client_s.toFixed(4)),
+            client_recv_to_buffer_s: Number(client_recv_to_buffer_s.toFixed(4)),
+            buffer_to_playback_s: Number(buffer_to_playback_s.toFixed(4)),
+            worklet_schedule_s: 0.0,
+            worklet_buffer_wait_s: Number(buffer_to_playback_s.toFixed(4)),
+            client_total_s: Number(client_total_s.toFixed(4)),
+            client_audio_queue_depth: 1,
+            buffered_audio_duration: Number(play_delay_s.toFixed(4)),
+            playback_queue_duration: Number(play_delay_s.toFixed(4)),
+          }));
+        }
+      }
+    }
+
     function scheduleAudio(pcmB64, sampleRate) {
       if (!audioCtx) return;
+      if (!clientAudioBufferStartTime) clientAudioBufferStartTime = performance.now();
       const bytes = b64ToBytes(pcmB64);
       const i16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
       const f32 = int16ToFloat32(i16);
@@ -457,11 +511,13 @@
       }
       if (playbackCursor < now + 0.02) playbackCursor = now + 0.02;
       src.start(playbackCursor);
+      reportScheduleLatency(now);
       playbackCursor += buf.duration;
     }
 
     function scheduleAudioFromPcm16(pcmU8, sampleRate) {
       if (!audioCtx) return;
+      if (!clientAudioBufferStartTime) clientAudioBufferStartTime = performance.now();
       const pcmCopy = pcmU8.slice();
       const i16 = new Int16Array(pcmCopy.buffer, 0, pcmCopy.byteLength / 2);
       const f32 = int16ToFloat32(i16);
@@ -477,10 +533,50 @@
       }
       if (playbackCursor < now + 0.02) playbackCursor = now + 0.02;
       src.start(playbackCursor);
+      reportScheduleLatency(now);
       playbackCursor += buf.duration;
     }
 
     const BIN_HDR = 44;
+    function reportAvatarLatency() {
+      if (clientAvatarLatencyReported || clientActiveTurnId === null) return;
+      clientAvatarLatencyReported = true;
+      const recv_t = clientAudioReceiveTime || clientAvatarFirstFrameRecvTime || performance.now();
+      const f_recv_t = clientAvatarFirstFrameRecvTime || recv_t;
+      const f_render_t = clientAvatarFirstFrameRenderTime || f_recv_t;
+      const f_mouth_t = clientAvatarFirstMouthMovementTime || f_render_t;
+      const f_mean_t = clientAvatarFirstMeaningfulSpeechTime || f_mouth_t;
+
+      let server_to_client_s = 0.001;
+      if (clientTurnServerSendTime > 0 && clientAudioReceiveWall > 0) {
+        server_to_client_s = Math.max(0.0005, (clientAudioReceiveWall - (clientTurnServerSendTime * 1000 + clientClockOffset)) / 1000);
+      } else if (clientTurnServerSendTime > 0) {
+        server_to_client_s = Math.max(0.0005, (Date.now() - (clientTurnServerSendTime * 1000 + clientClockOffset)) / 1000);
+      } else if (networkRttMs > 0) {
+        server_to_client_s = Math.max(0.0005, (networkRttMs / 2) / 1000);
+      }
+
+      const avatar_first_frame_recv_s = server_to_client_s + Math.max(0.0, (f_recv_t - recv_t) / 1000);
+      const avatar_first_frame_render_s = server_to_client_s + Math.max(0.0, (f_render_t - recv_t) / 1000);
+      const avatar_first_mouth_movement_s = server_to_client_s + Math.max(0.0, (f_mouth_t - recv_t) / 1000);
+      const avatar_first_meaningful_speech_s = server_to_client_s + Math.max(0.0, (f_mean_t - recv_t) / 1000);
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "client_avatar_latency",
+          turn_id: clientActiveTurnId,
+          server_to_client_s: Number(server_to_client_s.toFixed(4)),
+          avatar_first_frame_recv_s: Number(avatar_first_frame_recv_s.toFixed(4)),
+          avatar_first_frame_render_s: Number(avatar_first_frame_render_s.toFixed(4)),
+          avatar_first_mouth_movement_s: Number(avatar_first_mouth_movement_s.toFixed(4)),
+          avatar_first_meaningful_speech_s: Number(avatar_first_meaningful_speech_s.toFixed(4)),
+          frame_recv_to_render_s: Number(Math.max(0.0, (f_render_t - f_recv_t) / 1000).toFixed(4)),
+          frame_render_to_mouth_s: Number(Math.max(0.0, (f_mouth_t - f_render_t) / 1000).toFixed(4)),
+          mouth_to_meaningful_speech_s: Number(Math.max(0.0, (f_mean_t - f_mouth_t) / 1000).toFixed(4)),
+        }));
+      }
+    }
+
     async function handleBinaryAv(u8) {
       if (u8.byteLength < BIN_HDR) return;
       const magic = String.fromCharCode(u8[0], u8[1], u8[2], u8[3]);
@@ -496,6 +592,14 @@
       const pcmLen = dv.getUint32(28, true);
       const textLen = dv.getUint32(32, true);
       const chunksDone = dv.getUint32(36, true);
+      const flags = dv.getUint32(40, true);
+      const isMouthMoving = (flags & 1) !== 0;
+      const isMeaningfulSpeech = (flags & 2) !== 0;
+
+      if (!clientAvatarFirstFrameRecvTime && clientActiveTurnId !== null) {
+        clientAvatarFirstFrameRecvTime = performance.now();
+      }
+
       let o = BIN_HDR;
       if (o + jpegLen + pcmLen + textLen > u8.byteLength) return;
       const jpegU8 = u8.subarray(o, o + jpegLen); o += jpegLen;
@@ -511,7 +615,7 @@
       highestFrameReceived = Math.max(highestFrameReceived, frameIdx);
       if (!frameStore.has(frameIdx)) {
         const bitmap = await decodeFrameFromJpegBytes(jpegU8);
-        frameStore.set(frameIdx, { bitmap, chunkId });
+        frameStore.set(frameIdx, { bitmap, chunkId, isMouthMoving, isMeaningfulSpeech });
       }
       sServerFps.textContent = String(targetFps);
       sChunks.textContent = String(chunksDone);
@@ -560,6 +664,18 @@
           const frame = frameStore.get(frameIdx);
           frameStore.delete(frameIdx);
           drawFrameBitmap(frame.bitmap);
+          const nowMs = performance.now();
+          if (!clientAvatarFirstFrameRenderTime && clientActiveTurnId !== null) {
+            clientAvatarFirstFrameRenderTime = nowMs;
+          }
+          if (frame && frame.isMouthMoving && !clientAvatarFirstMouthMovementTime && clientActiveTurnId !== null) {
+            clientAvatarFirstMouthMovementTime = nowMs;
+          }
+          if (frame && frame.isMeaningfulSpeech && !clientAvatarFirstMeaningfulSpeechTime && clientActiveTurnId !== null) {
+            clientAvatarFirstMeaningfulSpeechTime = nowMs;
+            reportAvatarLatency();
+          }
+
           lastRenderedFrame = frameIdx;
           lastVideoChunkId = frame.chunkId;
           frameCounter++;
@@ -630,16 +746,45 @@
       ws.binaryType = "arraybuffer";
       ws.onopen = () => {
         setStatus("Connected. Starting...");
+        ws.send(JSON.stringify({ type: "ping", client_ts: performance.now() }));
         ws.send(JSON.stringify({ type: "start", sample_rate: audioCtx ? Math.round(audioCtx.sampleRate) : 48000 }));
         flushPendingOpusPages();
       };
       ws.onmessage = async (event) => {
         if (event.data instanceof ArrayBuffer) {
+          if (!clientAudioReceiveTime) {
+            clientAudioReceiveTime = performance.now();
+            clientAudioReceiveWall = Date.now();
+          }
           await handleBinaryAv(new Uint8Array(event.data));
           return;
         }
         if (typeof event.data !== "string") return;
         let msg; try { msg = JSON.parse(event.data); } catch { return; }
+
+        if (msg.type === "pong") {
+          const rtt = performance.now() - Number(msg.client_ts || 0);
+          networkRttMs = rtt;
+          if (msg.server_time) {
+            clientClockOffset = Date.now() - (Number(msg.server_time) * 1000 + rtt / 2);
+          }
+          return;
+        }
+
+        if (msg.type === "turn_audio_start") {
+          clientActiveTurnId = msg.turn_id;
+          clientTurnServerSendTime = Number(msg.server_send_time || 0);
+          clientAudioReceiveTime = 0;
+          clientAudioReceiveWall = 0;
+          clientAudioBufferStartTime = 0;
+          clientTurnLatencyReported = false;
+          clientAvatarFirstFrameRecvTime = 0;
+          clientAvatarFirstFrameRenderTime = 0;
+          clientAvatarFirstMouthMovementTime = 0;
+          clientAvatarFirstMeaningfulSpeechTime = 0;
+          clientAvatarLatencyReported = false;
+          return;
+        }
 
         if (msg.type === "server_ready") {
           serverSR = Number(msg.sample_rate || 24000);

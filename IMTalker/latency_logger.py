@@ -67,12 +67,27 @@ MARK_LABELS: dict[str, str] = {
     "lookup_injected": "'please wait' note handed to the model",
     "first_word": "assistant's FIRST spoken word (what the user feels)",
     "answer_complete": "assistant's LAST word of the answer",
-    # -- new 7-stage playback pipeline marks --------------------------------
-    "model_first_output":     "model produced first reply audio (RMS threshold crossed)",
-    "audio_first_chunk_ready":"first reply audio chunk ready and entering audio queue",
-    "audio_queue_enter":      "first reply audio packet entered the audio queue",
-    "audio_playback_start":   "first reply audio actually written to websocket (real playback start)",
-    "avatar_first_frame":     "first avatar video frame sent to browser",
+    # -- full 9-stage pipeline marks ----------------------------------------
+    "model_first_audio":          "model produced first reply audio chunk",
+    "model_first_output":         "model produced first reply audio (RMS threshold crossed)",
+    "audio_first_chunk_ready":    "first reply audio chunk ready and entering audio queue",
+    "audio_queue_enter":          "first reply audio packet entered the audio queue",
+    "server_audio_queue_wait":    "audio packet waited in server audio queue",
+    "server_send_loop_wait":      "audio sender pacing loop sleep duration",
+    "websocket_send_start":       "server started websocket send",
+    "server_audio_send":          "server wrote first audio packet to websocket",
+    "websocket_send_end":         "server completed websocket send",
+    "websocket_flush_await":      "server completed websocket await/flush",
+    "websocket_network_receive":  "browser websocket received first audio packet",
+    "client_audio_receive":       "browser websocket received first audio packet",
+    "audio_buffer_start":         "audio decoded and entered browser buffer",
+    "audio_worklet_start":        "audio entered AudioWorklet / scheduler",
+    "actual_audio_playback_start":"audio really started playing through speakers (ACTUAL PLAYBACK)",
+    "avatar_first_frame":         "first avatar video frame sent from server",
+    "avatar_first_frame_received":"browser websocket received first avatar video frame",
+    "avatar_first_frame_rendered":"browser painted first avatar video frame on canvas",
+    "avatar_first_mouth_movement":"first visible mouth movement painted on canvas",
+    "avatar_first_meaningful_speech": "FIRST_MEANINGFUL_AVATAR_SPEECH_FRAME painted on canvas [*]",
 }
 
 # Headline metrics, in the order they are printed. (field, label)
@@ -93,8 +108,36 @@ PLAYBACK_INTERVALS: list[tuple[str, str]] = [
     ("user_end_to_model_output_s", "User end -> model first output"),
     ("model_to_audio_ready_s",     "Model output -> audio chunk ready"),
     ("audio_ready_to_playback_s",  "Audio ready -> actual playback (queue wait)"),
-    ("user_end_to_playback_s",     "User end -> actual playback start  [*]"),
-    ("user_end_to_avatar_s",       "User end -> first avatar frame"),
+    ("user_end_to_playback_s",     "User end -> server websocket send"),
+    ("user_end_to_avatar_s",       "User end -> first avatar frame sent"),
+]
+
+# Detailed server-to-client trace intervals (finding exact delay source)
+SERVER_TO_CLIENT_TRACE_INTERVALS: list[tuple[str, str]] = [
+    ("server_audio_queue_wait_s",     "server_audio_queue_wait (queue backlog wait)"),
+    ("server_send_loop_wait_s",       "server_send_loop_wait (pacing sleep)"),
+    ("websocket_send_start_to_end_s", "websocket_send_start -> send_end (send duration)"),
+    ("websocket_flush_await_s",       "websocket_flush/await (ws lock/flush time)"),
+    ("websocket_network_transit_s",   "websocket/network_receive (network transport)"),
+    ("server_to_client_recv_s",       "SERVER_AUDIO_SEND -> CLIENT_AUDIO_RECEIVE [*]"),
+]
+
+# Real client-side audio playback breakdown intervals.
+CLIENT_INTERVALS: list[tuple[str, str]] = [
+    ("server_to_client_recv_s",       "Server send -> client receive"),
+    ("client_recv_to_buffer_s",       "Client receive -> audio buffer"),
+    ("audio_buffer_to_playback_s",    "Audio buffer -> playback"),
+    ("user_end_to_actual_playback_s", "User speech end -> actual audio playback [*]"),
+]
+
+# Real visible avatar response breakdown intervals.
+AVATAR_RESPONSE_INTERVALS: list[tuple[str, str]] = [
+    ("user_to_model_first_audio_s",       "User end -> model first audio"),
+    ("user_to_client_audio_recv_s",       "User end -> client audio receive"),
+    ("user_to_actual_playback_s",         "User end -> actual audio playback"),
+    ("user_to_first_avatar_frame_s",      "User end -> first avatar frame rendered"),
+    ("user_to_first_mouth_movement_s",    "User end -> first avatar mouth movement"),
+    ("user_to_first_meaningful_speech_s", "User end -> FIRST_MEANINGFUL_AVATAR_SPEECH_FRAME [*]"),
 ]
 
 _MAX_RETAINED_TURNS = 16
@@ -413,6 +456,151 @@ class LatencyLogger:
             m["bottleneck_stage"] = _bn_stage
             m["bottleneck_s"] = _bottleneck_candidates[_bn_stage]
 
+        # -- Real client-side audio playback breakdown (only from real timestamps) --
+        s_to_c = rec.counters.get("server_to_client_recv_s")
+        if s_to_c is None and "server_audio_send" in mk and "client_audio_receive" in mk:
+            s_to_c = max(0.0, mk["client_audio_receive"] - mk["server_audio_send"])
+        if s_to_c is not None:
+            m["server_to_client_recv_s"] = round(float(s_to_c), 3)
+
+        c_to_b = rec.counters.get("client_recv_to_buffer_s")
+        if c_to_b is None and "client_audio_receive" in mk and "audio_buffer_start" in mk:
+            c_to_b = max(0.0, mk["audio_buffer_start"] - mk["client_audio_receive"])
+        if c_to_b is not None:
+            m["client_recv_to_buffer_s"] = round(float(c_to_b), 3)
+
+        b_to_p = rec.counters.get("audio_buffer_to_playback_s")
+        if b_to_p is None and "audio_buffer_start" in mk and "actual_audio_playback_start" in mk:
+            b_to_p = max(0.0, mk["actual_audio_playback_start"] - mk["audio_buffer_start"])
+        if b_to_p is not None:
+            m["audio_buffer_to_playback_s"] = round(float(b_to_p), 3)
+
+        # -- Server-to-Client trace metrics & exact source isolation ---------
+        q_wait = rec.counters.get("server_audio_queue_wait_s", 0.0)
+        loop_wait = rec.counters.get("server_send_loop_wait_s", 0.0)
+        flush_await = rec.counters.get("websocket_flush_await_s", 0.0)
+        m["server_audio_queue_wait_s"] = round(float(q_wait), 4)
+        m["server_send_loop_wait_s"] = round(float(loop_wait), 4)
+        m["websocket_send_start_to_end_s"] = round(float(flush_await), 4)
+        m["websocket_flush_await_s"] = round(float(flush_await), 4)
+
+        if s_to_c is not None:
+            net_transit = max(0.0, float(s_to_c) - float(flush_await))
+            m["websocket_network_transit_s"] = round(net_transit, 4)
+
+        trace_candidates: dict[str, float] = {}
+        if float(q_wait) > 0.001:
+            trace_candidates["server_audio_queue_wait (queue backlog)"] = float(q_wait)
+        if float(loop_wait) > 0.001:
+            trace_candidates["server_send_loop_wait (pacing sleep)"] = float(loop_wait)
+        if float(flush_await) > 0.001:
+            trace_candidates["websocket_flush/await (ws send lock/flush)"] = float(flush_await)
+        if m.get("websocket_network_transit_s") is not None and float(m["websocket_network_transit_s"]) > 0.001:
+            trace_candidates["websocket_network_transit (network transport)"] = float(m["websocket_network_transit_s"])
+        if m.get("client_recv_to_buffer_s") is not None and float(m["client_recv_to_buffer_s"]) > 0.001:
+            trace_candidates["client_recv_to_audio_buffer (decoder/worker)"] = float(m["client_recv_to_buffer_s"])
+        if m.get("audio_buffer_to_playback_s") is not None and float(m["audio_buffer_to_playback_s"]) > 0.001:
+            trace_candidates["audio_buffer_to_playback (worklet buffer wait)"] = float(m["audio_buffer_to_playback_s"])
+
+        if trace_candidates:
+            exact_source = max(trace_candidates, key=trace_candidates.__getitem__)
+            m["exact_source_of_delay"] = exact_source
+            m["exact_source_delay_s"] = round(trace_candidates[exact_source], 3)
+        else:
+            m["exact_source_of_delay"] = "none / negligible"
+            m["exact_source_delay_s"] = 0.0
+
+        real_first_lat = None
+        if "actual_audio_playback_start" in mk:
+            real_first_lat = mk["actual_audio_playback_start"]
+        elif rec.counters.get("client_total_playback_s") is not None and "server_audio_send" in mk:
+            real_first_lat = mk["server_audio_send"] + float(s_to_c or 0.0) + float(rec.counters["client_total_playback_s"])
+        elif rec.counters.get("client_total_playback_s") is not None and "audio_playback_start" in mk:
+            real_first_lat = mk["audio_playback_start"] + float(s_to_c or 0.0) + float(rec.counters["client_total_playback_s"])
+
+        if real_first_lat is not None:
+            m["user_end_to_actual_playback_s"] = round(float(real_first_lat), 3)
+            m["real_first_audio_latency_s"] = round(float(real_first_lat), 3)
+
+        # Calculate biggest client-side delay
+        client_candidates: dict[str, float] = {}
+        if m.get("server_to_client_recv_s") is not None:
+            client_candidates["server_send_to_client_recv"] = float(m["server_to_client_recv_s"])
+        if m.get("client_recv_to_buffer_s") is not None:
+            client_candidates["client_recv_to_audio_buffer"] = float(m["client_recv_to_buffer_s"])
+        if m.get("audio_buffer_to_playback_s") is not None:
+            client_candidates["audio_buffer_to_playback"] = float(m["audio_buffer_to_playback_s"])
+
+        if client_candidates:
+            bn_client_stage = max(client_candidates, key=client_candidates.__getitem__)
+            m["biggest_client_delay_stage"] = bn_client_stage
+            m["biggest_client_delay_s"] = round(client_candidates[bn_client_stage], 3)
+
+        # Required avatar and visible mouth movement intervals:
+        _m_first = mk.get("model_first_audio", mk.get("model_first_output", mk.get("first_word")))
+        if _m_first is not None:
+            m["user_to_model_first_audio_s"] = round(float(_m_first), 3)
+
+        _c_recv = mk.get("client_audio_receive")
+        if _c_recv is not None:
+            m["user_to_client_audio_recv_s"] = round(float(_c_recv), 3)
+
+        _a_play = mk.get("actual_audio_playback_start", mk.get("audio_playback_start"))
+        if _a_play is not None:
+            m["user_to_actual_playback_s"] = round(float(_a_play), 3)
+
+        _f_rend = mk.get("avatar_first_frame_rendered", rec.counters.get("avatar_first_frame_rendered_s"))
+        if _f_rend is None and "avatar_first_frame" in mk:
+            _f_rend = mk["avatar_first_frame"]
+        if _f_rend is not None:
+            m["user_to_first_avatar_frame_s"] = round(float(_f_rend), 3)
+
+        _f_mouth = mk.get("avatar_first_mouth_movement", rec.counters.get("avatar_first_mouth_movement_s"))
+        if _f_mouth is not None:
+            m["user_to_first_mouth_movement_s"] = round(float(_f_mouth), 3)
+            m["actual_first_response_latency_s"] = round(float(_f_mouth), 3)
+        elif _f_rend is not None:
+            m["actual_first_response_latency_s"] = round(float(_f_rend), 3)
+        elif _a_play is not None:
+            m["actual_first_response_latency_s"] = round(float(_a_play), 3)
+
+        _f_mean = mk.get("avatar_first_meaningful_speech", rec.counters.get("avatar_first_meaningful_speech_s"))
+        if _f_mean is not None:
+            m["user_to_first_meaningful_speech_s"] = round(float(_f_mean), 3)
+            m["real_first_visible_speech_latency_s"] = round(float(_f_mean), 3)
+        elif _f_mouth is not None:
+            m["real_first_visible_speech_latency_s"] = round(float(_f_mouth), 3)
+        elif _f_rend is not None:
+            m["real_first_visible_speech_latency_s"] = round(float(_f_rend), 3)
+        elif _a_play is not None:
+            m["real_first_visible_speech_latency_s"] = round(float(_a_play), 3)
+
+        # Calculate biggest delay across all pipeline stages
+        delay_candidates: dict[str, float] = {}
+        if m.get("user_end_to_routing_s") is not None:
+            delay_candidates["user_end_to_routing"] = float(m["user_end_to_routing_s"])
+        if m.get("routing_to_model_output_s") is not None:
+            delay_candidates["routing_to_model_output"] = float(m["routing_to_model_output_s"])
+        if m.get("model_to_audio_ready_s") is not None:
+            delay_candidates["model_to_audio_ready"] = float(m["model_to_audio_ready_s"])
+        if m.get("server_to_client_recv_s") is not None:
+            delay_candidates["server_send_to_client_recv"] = float(m["server_to_client_recv_s"])
+        if m.get("client_recv_to_buffer_s") is not None:
+            delay_candidates["client_recv_to_audio_buffer"] = float(m["client_recv_to_buffer_s"])
+        if m.get("audio_buffer_to_playback_s") is not None:
+            delay_candidates["audio_buffer_to_playback"] = float(m["audio_buffer_to_playback_s"])
+        if _f_rend is not None and _a_play is not None and float(_f_rend) >= float(_a_play):
+            delay_candidates["playback_to_avatar_frame_render"] = max(0.0, round(float(_f_rend) - float(_a_play), 3))
+        if _f_mouth is not None and _f_rend is not None and float(_f_mouth) >= float(_f_rend):
+            delay_candidates["frame_render_to_mouth_movement"] = max(0.0, round(float(_f_mouth) - float(_f_rend), 3))
+        if _f_mean is not None and _f_mouth is not None and float(_f_mean) >= float(_f_mouth):
+            delay_candidates["mouth_movement_to_meaningful_speech"] = max(0.0, round(float(_f_mean) - float(_f_mouth), 3))
+
+        if delay_candidates:
+            bn_stage = max(delay_candidates, key=delay_candidates.__getitem__)
+            m["biggest_delay_stage"] = bn_stage
+            m["biggest_delay_s"] = round(delay_candidates[bn_stage], 3)
+
         return m
 
 
@@ -504,9 +692,71 @@ class LatencyLogger:
             if _bn_stage:
                 lines.append(f"  BOTTLENECK : {_bn_stage}")
             if _total_latency is not None:
-                lines.append(f"  LATENCY    : {float(_total_latency):.3f}s  (user end -> actual playback start)")
+                lines.append(f"  LATENCY    : {float(_total_latency):.3f}s  (user end -> server websocket send)")
             elif _bn_s is not None:
                 lines.append(f"  LATENCY    : {float(_bn_s):.3f}s  (bottleneck stage only)")
+
+        # -- Server-to-Client trace breakdown --------------------------------
+        _has_trace = any(field in metrics for field, _ in SERVER_TO_CLIENT_TRACE_INTERVALS)
+        if _has_trace:
+            lines.append("")
+            lines.append("Server-to-Client delay trace breakdown (seconds):")
+            for field, label in SERVER_TO_CLIENT_TRACE_INTERVALS:
+                if field in metrics:
+                    val = metrics[field]
+                    lines.append(f"  {label:<48} {float(val):7.3f}s")
+                else:
+                    lines.append(f"  {label:<48}     n/a   (mark not reached)")
+            lines.append("")
+            _s_to_c_val = metrics.get("server_to_client_recv_s")
+            _exact_src = metrics.get("exact_source_of_delay", "")
+            if _s_to_c_val is not None:
+                lines.append(f"  SERVER -> CLIENT DELAY    : {float(_s_to_c_val):.3f}s")
+            if _exact_src:
+                lines.append(f"  EXACT SOURCE OF DELAY     : {_exact_src}")
+
+        # -- Real client-side audio playback breakdown ----------------------
+        _has_client = any(field in metrics for field, _ in CLIENT_INTERVALS)
+        if _has_client:
+            lines.append("")
+            lines.append("Real client-side audio playback breakdown (seconds):")
+            for field, label in CLIENT_INTERVALS:
+                if field in metrics:
+                    val = metrics[field]
+                    lines.append(f"  {label:<44} {float(val):7.3f}s")
+                else:
+                    lines.append(f"  {label:<44}     n/a   (mark not reached)")
+            lines.append("")
+            _real_lat = metrics.get("real_first_audio_latency_s", metrics.get("user_end_to_actual_playback_s"))
+            _big_client_stage = metrics.get("biggest_client_delay_stage", "")
+            _big_client_s = metrics.get("biggest_client_delay_s")
+            if _real_lat is not None:
+                lines.append(f"  REAL FIRST AUDIO LATENCY  : {float(_real_lat):.3f}s")
+            if _big_client_stage and _big_client_s is not None:
+                lines.append(f"  BIGGEST CLIENT-SIDE DELAY : {_big_client_stage} = {float(_big_client_s):.3f}s")
+
+        # -- Visible avatar response breakdown -------------------------------
+        _has_avatar = any(field in metrics for field, _ in AVATAR_RESPONSE_INTERVALS)
+        if _has_avatar:
+            lines.append("")
+            lines.append("Visible avatar response breakdown (seconds from user speech end):")
+            for field, label in AVATAR_RESPONSE_INTERVALS:
+                if field in metrics:
+                    val = metrics[field]
+                    lines.append(f"  {label:<44} {float(val):7.3f}s")
+                else:
+                    lines.append(f"  {label:<44}     n/a   (mark not reached)")
+            lines.append("")
+            _actual_lat = metrics.get("actual_first_response_latency_s", metrics.get("user_to_first_mouth_movement_s"))
+            _real_vis = metrics.get("real_first_visible_speech_latency_s", _actual_lat)
+            _big_stage = metrics.get("biggest_delay_stage", "")
+            _big_s = metrics.get("biggest_delay_s")
+            if _actual_lat is not None:
+                lines.append(f"  ACTUAL FIRST RESPONSE LATENCY     : {float(_actual_lat):.3f}s")
+            if _real_vis is not None:
+                lines.append(f"  REAL FIRST VISIBLE SPEECH LATENCY : {float(_real_vis):.3f}s")
+            if _big_stage and _big_s is not None:
+                lines.append(f"  BIGGEST DELAY                     : {_big_stage} = {float(_big_s):.3f}s")
 
         lines.append("=" * w)
         lines.append("")
@@ -559,6 +809,36 @@ class LatencyLogger:
         latency = playback if playback is not None else metrics.get("question_to_first_word_s")
         if latency is not None:
             parts.append(f"LATENCY={float(latency):.3f}s")
+
+        # Real client playback summary on console
+        real_playback = metrics.get("real_first_audio_latency_s", metrics.get("user_end_to_actual_playback_s"))
+        if real_playback is not None:
+            parts.append(f"REAL FIRST AUDIO LATENCY: {float(real_playback):.3f}s")
+        big_client_stage = metrics.get("biggest_client_delay_stage", "")
+        big_client_s = metrics.get("biggest_client_delay_s")
+        if big_client_stage and big_client_s is not None:
+            parts.append(f"BIGGEST CLIENT-SIDE DELAY: {big_client_stage}={float(big_client_s):.3f}s")
+
+        # Trace and required turn summary outputs
+        s_to_c_val = metrics.get("server_to_client_recv_s")
+        exact_src = metrics.get("exact_source_of_delay")
+        real_vis_lat = metrics.get("real_first_visible_speech_latency_s", metrics.get("actual_first_response_latency_s"))
+        if s_to_c_val is not None:
+            parts.append(f"SERVER -> CLIENT DELAY: {float(s_to_c_val):.3f}s")
+        if exact_src:
+            parts.append(f"EXACT SOURCE OF DELAY: <{exact_src}>")
+        if real_vis_lat is not None:
+            parts.append(f"REAL FIRST VISIBLE SPEECH LATENCY: {float(real_vis_lat):.3f}s")
+
+        # Actual visible avatar response on console
+        actual_resp = metrics.get("actual_first_response_latency_s", metrics.get("user_to_first_mouth_movement_s"))
+        if actual_resp is not None:
+            parts.append(f"ACTUAL FIRST RESPONSE LATENCY: {float(actual_resp):.3f}s")
+        big_delay_stage = metrics.get("biggest_delay_stage", "")
+        big_delay_s = metrics.get("biggest_delay_s")
+        if big_delay_stage and big_delay_s is not None:
+            parts.append(f"BIGGEST DELAY: {big_delay_stage}={float(big_delay_s):.3f}s")
+
         return f"[LATENCY] turn {rec.turn_id}: " + " ".join(parts)
 
     # -- session close -----------------------------------------------------

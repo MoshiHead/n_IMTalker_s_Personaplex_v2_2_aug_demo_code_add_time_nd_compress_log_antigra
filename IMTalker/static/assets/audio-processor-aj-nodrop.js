@@ -31,7 +31,16 @@ class MoshiProcessor extends AudioWorkletProcessor {
         this.initState();
         return;
       }
+      if (event.data.type == "new_turn") {
+        this.activeTurnId = event.data.turnId;
+        this.turnFirstPlaybackReported = false;
+        return;
+      }
       let frame = event.data.frame;
+      if (event.data.turnId !== undefined && event.data.turnId !== this.activeTurnId) {
+        this.activeTurnId = event.data.turnId;
+        this.turnFirstPlaybackReported = false;
+      }
       this.lastMicDuration = Number(event.data.micDuration || 0);
       this.frames.push(frame);
       if (this.currentSamples() >= this.initialBufferSamples && !this.started) {
@@ -82,6 +91,8 @@ class MoshiProcessor extends AudioWorkletProcessor {
     this.lastMicDuration = 0.;
     this.reportCounter = 0;
     this.partialBufferSamples = this.initialPartialBufferSamples;
+    this.activeTurnId = null;
+    this.turnFirstPlaybackReported = false;
     this.resetStart();
 
     // Metrics
@@ -173,6 +184,17 @@ class MoshiProcessor extends AudioWorkletProcessor {
         this.offsetInFirstBuffer = 0;
         this.frames.shift();
       }
+    }
+    if (out_idx > 0 && !this.turnFirstPlaybackReported) {
+      this.turnFirstPlaybackReported = true;
+      this.port.postMessage({
+        type: "actual_playback_start",
+        turnId: this.activeTurnId,
+        queuedSamples: this.currentSamples(),
+        sampleRate: sampleRate,
+        currentTime: currentTime,
+        timestamp: Date.now(),
+      });
     }
     if (this.firstOut) {
       this.firstOut = false;

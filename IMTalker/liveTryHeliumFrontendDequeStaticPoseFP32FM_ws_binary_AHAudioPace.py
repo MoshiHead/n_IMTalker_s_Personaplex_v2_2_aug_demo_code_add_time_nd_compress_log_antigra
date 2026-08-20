@@ -1627,10 +1627,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     self._turn_first_speech_epoch, "first_word",
                     f"microphone backlog {backlog_s:.2f}s at this moment",
                 )
-                # MODEL_FIRST_OUTPUT: same instant as first_word (same _step tick),
-                # recorded as its own named mark so the playback-pipeline breakdown
-                # in latency_logger can measure model-output → audio-queue-enter
-                # separately from the legacy first_word mark.
+                self.conv_logger.latency.mark(
+                    self._turn_first_speech_epoch, "model_first_audio",
+                    f"model own rms={model_own_rms:.5f}",
+                )
                 self.conv_logger.latency.mark(
                     self._turn_first_speech_epoch, "model_first_output",
                     f"model own rms={model_own_rms:.5f}",
@@ -1638,6 +1638,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.conv_logger.latency.count(
                     self._turn_first_speech_epoch,
                     input_backlog_s_at_first_word=round(backlog_s, 3),
+                    input_backlog=round(backlog_s, 3),
                 )
 
         # "Thinking sound": while an online search is in flight, replace what
@@ -2819,11 +2820,26 @@ class LiveHeliumFMEngine:
         packets = []
         gen_ms_i = int(round(float(total_gen_ms)))
         sr_i = int(round(float(TARGET_SR)))
+        ref_motion = self.ref_x.detach().float().to(motion_sub.device)
+        if ref_motion.ndim == 3:
+            ref_motion = ref_motion[0, 0]
+        elif ref_motion.ndim == 2:
+            ref_motion = ref_motion[0]
+
         for j, fut in enumerate(jpeg_futures):
             idx = abs_start + j
             audio_slice = audio_slices[j] if j < len(audio_slices) else np.zeros(
                 int(round(TARGET_SR / self.fps)), dtype=np.float32
             )
+            slice_rms = float(np.sqrt(np.mean(np.square(audio_slice, dtype=np.float32)))) if audio_slice.size else 0.0
+            motion_j = motion_sub[j].detach().float()
+            disp = float(torch.norm(motion_j - ref_motion).item()) if ref_motion.shape == motion_j.shape else 0.0
+            # A frame has active mouth movement if audio RMS > 0.006 or motion displacement > 0.05
+            is_mouth_moving = slice_rms > 0.006 or disp > 0.05
+            # FIRST_MEANINGFUL_AVATAR_SPEECH_FRAME: voiced speech RMS >= 0.018 or meaningful facial speech motion >= 0.15
+            is_meaningful_speech = slice_rms >= 0.018 or disp >= 0.15
+            flags = (1 if is_mouth_moving else 0) | (2 if is_meaningful_speech else 0)
+
             jpeg_bytes = fut.result()
             output_audio_codec = str(
                 getattr(self.args, "output_audio_codec", "pcm")
@@ -2842,6 +2858,7 @@ class LiveHeliumFMEngine:
                 pcm_b,
                 text_payload,
                 int(avatar_chunk_id),
+                flags,
             )
             packets.append(
                 {
@@ -2850,6 +2867,8 @@ class LiveHeliumFMEngine:
                     "data": blob,
                     "audio_pcm": np.asarray(audio_slice, dtype=np.float32).copy(),
                     "t_ready": time.perf_counter(),
+                    "is_mouth_moving": is_mouth_moving,
+                    "is_meaningful_speech": is_meaningful_speech,
                 }
             )
         return packets
@@ -3882,6 +3901,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                     audio_slice,
                                     dtype=np.float32,
                                 ).copy(),
+                                "t_enqueued": time.perf_counter(),
                             })
                             # Mark fires on the first packet (frame_offset==0) of the
                             # first chunk for this turn, AFTER enqueue so the queue
@@ -4145,10 +4165,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     packet = await audio_q.get()
                     if packet is None:
                         break
+                    t_dequeued = time.perf_counter()
+                    t_enqueued = packet.get("t_enqueued", t_dequeued)
+                    q_wait_s = max(0.0, t_dequeued - t_enqueued)
                     idx = int(packet["frame_number"])
                     target_t = send_start_wall + idx / float(args.fps)
                     target_t = max(target_t, next_send_wall)
                     sleep_s = target_t - time.perf_counter()
+                    loop_wait_s = max(0.0, sleep_s)
                     if sleep_s > 0:
                         await asyncio.sleep(sleep_s)
                     next_send_wall = max(target_t, time.perf_counter()) + min_send_interval_s
@@ -4161,21 +4185,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     if opus_payload is None and hasattr(opus_writer, "read_bytes"):
                         opus_payload = opus_writer.read_bytes()
                     if opus_payload:
-                        try:
-                            async with ws_send_lock:
-                                await ws.send_bytes(b"\x01" + opus_payload)
-                        except (WebSocketDisconnect, RuntimeError, Exception):
-                            break
-                        # AUDIO_PLAYBACK_START: record the instant the first
-                        # Opus audio of this turn actually leaves the server.
-                        # This is the honest "answer audio is playing" moment --
-                        # it includes the target_t pacing sleep that the GPU
-                        # thread cannot see, so it is always >= audio_queue_enter.
                         _cur_turn_id = getattr(reply_engine, "_latency_turn_id", None)
-                        if (
+                        _is_first_chunk = (
                             _cur_turn_id is not None
                             and _cur_turn_id != _lat_audio_play_last_turn_id
-                        ):
+                        )
+                        _t_send_mono = time.perf_counter()
+                        _t_send_wall = time.time()
+                        if _is_first_chunk:
                             _lat_audio_play_last_turn_id = _cur_turn_id
                             with contextlib.suppress(Exception):
                                 _aq = audio_q.qsize()
@@ -4183,9 +4200,24 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 _bl = round(reply_engine.input_backlog_sec(), 3)
                                 _lat = reply_engine.conv_logger.latency
                                 _lat.mark(
+                                    _cur_turn_id, "server_audio_queue_wait",
+                                    f"{q_wait_s*1000:.1f}ms",
+                                )
+                                _lat.mark(
+                                    _cur_turn_id, "server_send_loop_wait",
+                                    f"{loop_wait_s*1000:.1f}ms",
+                                )
+                                _lat.mark(
+                                    _cur_turn_id, "websocket_send_start",
+                                    f"audio_q={_aq} frame_q={_fq}",
+                                )
+                                _lat.mark(
+                                    _cur_turn_id, "server_audio_send",
+                                    f"audio_q={_aq} frame_q={_fq} input_backlog={_bl}s",
+                                )
+                                _lat.mark(
                                     _cur_turn_id, "audio_playback_start",
-                                    f"audio_q={_aq} frame_q={_fq} "
-                                    f"input_backlog={_bl}s",
+                                    f"audio_q={_aq} frame_q={_fq} input_backlog={_bl}s",
                                 )
                                 _lat.count(
                                     _cur_turn_id,
@@ -4195,7 +4227,40 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                     pending_audio_duration=round(
                                         _aq / float(args.fps), 3
                                     ),
+                                    server_audio_queue_wait_s=round(q_wait_s, 4),
+                                    server_send_loop_wait_s=round(loop_wait_s, 4),
                                 )
+                        try:
+                            async with ws_send_lock:
+                                if _is_first_chunk:
+                                    await ws.send_json({
+                                        "type": "turn_audio_start",
+                                        "turn_id": _cur_turn_id,
+                                        "server_send_time": _t_send_wall,
+                                        "server_send_mono": _t_send_mono,
+                                        "server_audio_queue_wait_s": round(q_wait_s, 4),
+                                        "server_send_loop_wait_s": round(loop_wait_s, 4),
+                                    })
+                                await ws.send_bytes(b"\x01" + opus_payload)
+                                _t_send_end = time.perf_counter()
+                                _flush_s = max(0.0, _t_send_end - _t_send_mono)
+                                if _is_first_chunk:
+                                    with contextlib.suppress(Exception):
+                                        _lat = reply_engine.conv_logger.latency
+                                        _lat.mark(
+                                            _cur_turn_id, "websocket_send_end",
+                                            f"flush={_flush_s*1000:.1f}ms",
+                                        )
+                                        _lat.mark(
+                                            _cur_turn_id, "websocket_flush_await",
+                                            f"{_flush_s*1000:.1f}ms",
+                                        )
+                                        _lat.count(
+                                            _cur_turn_id,
+                                            websocket_flush_await_s=round(_flush_s, 4),
+                                        )
+                        except (WebSocketDisconnect, RuntimeError, Exception):
+                            break
                         packets_sent += 1
                         bytes_sent += len(opus_payload)
 
@@ -4308,7 +4373,79 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 msg_type = str(payload.get("type", "")).lower()
                 print(f"[liveTryHeliumFM] rx text type={msg_type or '<empty>'}", flush=True)
 
-                if msg_type == "start":
+                if msg_type == "ping":
+                    await ws.send_json({
+                        "type": "pong",
+                        "client_ts": payload.get("client_ts", 0),
+                        "server_time": time.time(),
+                    })
+                    continue
+
+                elif msg_type in ("client_audio_latency", "client_avatar_latency"):
+                    turn_id = payload.get("turn_id")
+                    if reply_engine is not None and turn_id is not None:
+                        with contextlib.suppress(Exception):
+                            lat = reply_engine.conv_logger.latency
+                            rec = lat.get(turn_id)
+                            if rec is not None:
+                                t0 = rec.t0
+                                t_send_offset = rec.marks.get("server_audio_send", rec.marks.get("audio_playback_start", 0.0))
+
+                                if "server_to_client_s" in payload or "buffer_to_playback_s" in payload:
+                                    s_to_c = float(payload.get("server_to_client_s", 0.0))
+                                    c_recv_to_buf = float(payload.get("client_recv_to_buffer_s", 0.0))
+                                    buf_to_play = float(payload.get("buffer_to_playback_s", 0.0))
+                                    client_tot = float(payload.get("client_total_s", 0.0))
+
+                                    lat.mark(turn_id, "websocket_network_receive", at=t0 + t_send_offset + s_to_c)
+                                    lat.mark(turn_id, "client_audio_receive", at=t0 + t_send_offset + s_to_c)
+                                    lat.mark(turn_id, "audio_buffer_start", at=t0 + t_send_offset + s_to_c + c_recv_to_buf)
+                                    lat.mark(turn_id, "actual_audio_playback_start", at=t0 + t_send_offset + s_to_c + client_tot)
+
+                                    lat.count(
+                                        turn_id,
+                                        client_audio_queue_depth=int(payload.get("client_audio_queue_depth", 0)),
+                                        buffered_audio_duration=float(payload.get("buffered_audio_duration", 0.0)),
+                                        playback_queue_duration=float(payload.get("playback_queue_duration", 0.0)),
+                                        server_to_client_recv_s=s_to_c,
+                                        client_recv_to_buffer_s=c_recv_to_buf,
+                                        audio_buffer_to_playback_s=buf_to_play,
+                                        client_total_playback_s=client_tot,
+                                    )
+
+                                # Avatar frame and visible mouth movement timestamps
+                                if "avatar_first_frame_recv_s" in payload:
+                                    f_recv_s = float(payload["avatar_first_frame_recv_s"])
+                                    lat.mark(turn_id, "avatar_first_frame_received", at=t0 + t_send_offset + f_recv_s)
+                                    lat.count(turn_id, avatar_first_frame_received_s=round(t_send_offset + f_recv_s, 3))
+
+                                if "avatar_first_frame_render_s" in payload:
+                                    f_render_s = float(payload["avatar_first_frame_render_s"])
+                                    lat.mark(turn_id, "avatar_first_frame_rendered", at=t0 + t_send_offset + f_render_s)
+                                    lat.count(turn_id, avatar_first_frame_rendered_s=round(t_send_offset + f_render_s, 3))
+
+                                if "avatar_first_mouth_movement_s" in payload:
+                                    f_mouth_s = float(payload["avatar_first_mouth_movement_s"])
+                                    lat.mark(turn_id, "avatar_first_mouth_movement", at=t0 + t_send_offset + f_mouth_s)
+                                    lat.count(turn_id, avatar_first_mouth_movement_s=round(t_send_offset + f_mouth_s, 3))
+
+                                if "avatar_first_meaningful_speech_s" in payload:
+                                    f_mean_s = float(payload["avatar_first_meaningful_speech_s"])
+                                    lat.mark(turn_id, "avatar_first_meaningful_speech", at=t0 + t_send_offset + f_mean_s)
+                                    lat.count(turn_id, avatar_first_meaningful_speech_s=round(t_send_offset + f_mean_s, 3))
+
+                                    real_speech_lat = t_send_offset + f_mean_s
+                                    # Print real meaningful speech summary
+                                    print(
+                                        f"\n[AVATAR LATENCY] TURN {turn_id}:\n"
+                                        f"  SERVER -> CLIENT DELAY: {float(payload.get('server_to_client_s', 0.0)):.3f}s\n"
+                                        f"  REAL FIRST VISIBLE SPEECH LATENCY: {real_speech_lat:.3f}s\n"
+                                        f"  (USER_SPEECH_END -> FIRST_MEANINGFUL_AVATAR_SPEECH_FRAME)\n",
+                                        flush=True,
+                                    )
+                    continue
+
+                elif msg_type == "start":
                     browser_input_sr = int(payload.get("sample_rate", payload.get("sampleRate", browser_input_sr)))
                     if fm_engine.audio_pcm is not None and (stream_task is None or stream_task.done()):
                         fm_engine.reset_session()
